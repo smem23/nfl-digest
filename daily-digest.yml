@@ -1,0 +1,42 @@
+name: NFL Daily Digest
+
+on:
+  schedule:
+    # Target: 11:00 Europe/Dublin. Cron runs in UTC with no DST handling, so we
+    # fire twice — 10:00 UTC (Irish Summer Time, UTC+1) and 11:00 UTC (winter,
+    # UTC+0). digest.py checks the real Dublin local time and the non-11:00 run
+    # exits without sending. GitHub may delay scheduled runs by a few minutes
+    # under load, so the guard allows the whole 11:00 hour.
+    - cron: "0 10 * * *"
+    - cron: "0 11 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nfl-digest
+  cancel-in-progress: false
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build and send digest
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        run: python digest.py
