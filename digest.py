@@ -18,13 +18,9 @@ added later without a rewrite: set TEAM and fill in build_team_section().
 from __future__ import annotations
 
 import os
-import ssl
 import sys
-import smtplib
 import traceback
 from datetime import datetime, timedelta
-from email.mime.text import MIMEText
-from email.utils import formatdate
 from zoneinfo import ZoneInfo
 
 import requests
@@ -318,24 +314,29 @@ def generate_digest(sections: dict[str, str]) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Email
+# Email (Resend HTTP API — https://resend.com/docs/api-reference/emails)
 # --------------------------------------------------------------------------- #
 
+# Resend's shared sender works with no domain setup, but only delivers to the
+# address that owns the Resend account. Once you verify your own domain, set the
+# EMAIL_FROM secret to something like "NFL Digest <nfl@yourdomain.com>".
+DEFAULT_FROM = "NFL Digest <onboarding@resend.dev>"
+
+
 def send_email(subject: str, body: str) -> None:
-    sender = os.environ["EMAIL_ADDRESS"]
-    password = os.environ["EMAIL_APP_PASSWORD"]
+    api_key = os.environ["RESEND_API_KEY"]
     recipient = os.environ["RECIPIENT_EMAIL"]
+    sender = os.environ.get("EMAIL_FROM") or DEFAULT_FROM
 
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = sender
-    msg["To"] = recipient
-    msg["Date"] = formatdate(localtime=True)
-
-    context = ssl.create_default_context()
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=30) as server:
-        server.login(sender, password)
-        server.sendmail(sender, [recipient], msg.as_string())
+    resp = requests.post(
+        "https://api.resend.com/emails",
+        headers={"Authorization": f"Bearer {api_key}",
+                 "Content-Type": "application/json"},
+        json={"from": sender, "to": [recipient], "subject": subject, "text": body},
+        timeout=30,
+    )
+    if resp.status_code >= 300:
+        raise RuntimeError(f"Resend API returned {resp.status_code}: {resp.text}")
 
 
 def _safe_send(subject: str, body: str) -> None:

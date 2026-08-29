@@ -8,7 +8,7 @@ needs to stay on.
 - **Schedule:** daily, targeting **11:00 Europe/Dublin**
 - **Data:** ESPN's public (unofficial) API for scores/standings + RSS feeds for headlines
 - **Summariser:** Anthropic API (Claude) turns the raw data into the written digest
-- **Delivery:** email over Gmail SMTP (app password)
+- **Delivery:** email via the [Resend](https://resend.com) API (free tier)
 - **Secrets:** GitHub encrypted repository secrets — never committed
 
 ## Digest format
@@ -26,31 +26,35 @@ in `digest.py`) and can be switched on later without restructuring anything.
 
 ## Setup
 
-### 1. Gmail app password
+### 1. Resend account + API key
 
-The digest sends over Gmail SMTP. On the Google account you want to send *from*:
-
-1. Turn on 2-Step Verification (required for app passwords).
-2. Create an app password: <https://myaccount.google.com/apppasswords> → name it
-   "nfl-digest" → copy the 16-character value.
+1. Sign up at <https://resend.com> — **use the address you want the digest
+   delivered to** (e.g. `hello@sammemery.com`). Resend's shared sender
+   (`onboarding@resend.dev`) only delivers to the account owner's address until
+   you verify your own domain, so this needs to match `RECIPIENT_EMAIL`.
+2. **API Keys → Create API Key** → name it `nfl-digest`, permission "Sending
+   access" → copy the `re_...` value.
+3. *(Optional, later)* verify a domain under **Domains** and then set the
+   `EMAIL_FROM` secret to `NFL Digest <nfl@yourdomain.com>` to send from your own
+   address and to any recipient.
 
 ### 2. Anthropic API key
 
-Get a key from <https://console.anthropic.com/> → **API Keys**. The digest uses
-the model set in `digest.py` (`MODEL`, currently `claude-opus-5`; switch to
-`claude-sonnet-5` for a cheaper run). Cost is a fraction of a cent per day.
+Get a key from <https://console.anthropic.com/> → **API Keys**, and add a payment
+method / credit under **Billing**. The digest uses the model set in `digest.py`
+(`MODEL`, currently `claude-opus-5`; switch to `claude-sonnet-5` for a cheaper
+run). Cost is a fraction of a cent per day.
 
 ### 3. Repository secrets
 
-Repo → **Settings → Secrets and variables → Actions → New repository secret**.
-Add all four:
+Repo → **Settings → Secrets and variables → Actions → New repository secret**:
 
 | Secret | Value |
 | --- | --- |
-| `ANTHROPIC_API_KEY` | your Anthropic key |
-| `EMAIL_ADDRESS` | the Gmail address to send from |
-| `EMAIL_APP_PASSWORD` | the 16-char app password (no spaces) |
-| `RECIPIENT_EMAIL` | where the digest should land |
+| `ANTHROPIC_API_KEY` | your Anthropic key (`sk-ant-...`) |
+| `RESEND_API_KEY` | your Resend key (`re_...`) |
+| `RECIPIENT_EMAIL` | where the digest should land (= your Resend signup email) |
+| `EMAIL_FROM` | *(optional)* custom From once you've verified a domain in Resend |
 
 ### 4. Run it manually first
 
@@ -71,8 +75,7 @@ DIGEST_DRY_RUN=1 ANTHROPIC_API_KEY=sk-ant-... python digest.py
 
 # 3. full run — actually sends the email
 export ANTHROPIC_API_KEY=sk-ant-...
-export EMAIL_ADDRESS=you@gmail.com
-export EMAIL_APP_PASSWORD=xxxxxxxxxxxxxxxx
+export RESEND_API_KEY=re_...
 export RECIPIENT_EMAIL=you@example.com
 python digest.py
 ```
