@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """NFL Daily Digest.
 
-Fetch NFL scores, standings and headlines, ask Claude to turn them into a short
-plain-text digest, and email it.
+Fetch NFL scores, standings and headlines, assemble a short plain-text digest,
+and email it.
+
+By default the digest is built entirely in Python and costs nothing to run.
+Set USE_LLM = True (and provide an Anthropic API key + credit) to have Claude
+write a smoother, more editorial version instead.
 
 Build steps (see README) are driven by environment variables so each stage can
 be tested on its own:
 
-    DIGEST_SKIP_LLM=1   fetch data and print the raw sections, no Claude, no email
-    DIGEST_DRY_RUN=1    build the digest with Claude but print it, don't email
+    DIGEST_SKIP_LLM=1   fetch data and print the raw sections, then stop
+    DIGEST_DRY_RUN=1    build the full digest but print it instead of emailing
     DIGEST_FORCE=1      ignore the "is it 11:00 in Dublin?" cron guard
 
 The script is deliberately structured so a per-team "Your Team" section can be
@@ -18,6 +22,7 @@ added later without a rewrite: set TEAM and fill in build_team_section().
 from __future__ import annotations
 
 import os
+import re
 import sys
 import traceback
 from datetime import datetime, timedelta
@@ -25,7 +30,6 @@ from zoneinfo import ZoneInfo
 
 import requests
 import feedparser
-import anthropic
 
 
 # --------------------------------------------------------------------------- #
@@ -35,7 +39,11 @@ import anthropic
 LOCAL_TZ = ZoneInfo("Europe/Dublin")
 EASTERN_TZ = ZoneInfo("America/New_York")  # NFL scheduling is US-Eastern
 
-MODEL = "claude-opus-5"  # swap to "claude-sonnet-5" to cut cost ~2.5x
+# Free by default. Set True to have Claude write the digest — this calls the
+# Anthropic API, which is pay-as-you-go (~$1/month here) and needs ANTHROPIC_API_KEY
+# plus loaded credit. See README "Optional: LLM-written digest".
+USE_LLM = False
+MODEL = "claude-opus-5"  # used only when USE_LLM is True; "claude-sonnet-5" is cheaper
 
 # Future: set to a team abbreviation (e.g. "PHI") to enable the "Your Team"
 # section at the top of the digest. While None, this is a general league digest.
@@ -221,7 +229,7 @@ def fetch_schedule() -> str:
 # --------------------------------------------------------------------------- #
 
 def fetch_headlines() -> str:
-    items: list[str] = []
+    per_feed: list[list[str]] = []
     errors: list[str] = []
     for name, url in RSS_FEEDS:
         try:
@@ -230,18 +238,71 @@ def fetch_headlines() -> str:
             parsed = feedparser.parse(resp.content)
             if not parsed.entries:
                 raise RuntimeError(getattr(parsed, "bozo_exception", "no entries"))
-            for entry in parsed.entries[:8]:
-                title = (entry.get("title") or "").strip()
-                if title:
-                    items.append(f"  - [{name}] {title}")
+            feed_items = [
+                f"  - [{name}] {title}"
+                for entry in parsed.entries[:8]
+                if (title := (entry.get("title") or "").strip())
+            ]
+            if feed_items:
+                per_feed.append(feed_items)
         except Exception as e:  # noqa: BLE001
             errors.append(f"{name}: {e}")
 
-    if not items:
+    # Round-robin across feeds so the top of the list is a mix of sources.
+    interleaved: list[str] = []
+    for i in range(max((len(f) for f in per_feed), default=0)):
+        for feed in per_feed:
+            if i < len(feed):
+                interleaved.append(feed[i])
+
+    if not interleaved:
         raise FetchError("headlines: " + " | ".join(errors))
     if errors:
-        items.append("  (feeds that failed: " + "; ".join(errors) + ")")
-    return "\n".join(items)
+        interleaved.append("  (feeds that failed: " + "; ".join(errors) + ")")
+    return "\n".join(interleaved)
+
+
+# --------------------------------------------------------------------------- #
+# Stat of the day (computed from the box scores — no LLM needed)
+# --------------------------------------------------------------------------- #
+
+def compute_stat_of_day() -> str | None:
+    """Pull one number out of the most recent slate of finals."""
+    try:
+        today_et = datetime.now(EASTERN_TZ).date()
+        for offset in (1, 2, 3):
+            day = today_et - timedelta(days=offset)
+            data = _get_json(f"{ESPN_SITE}/scoreboard",
+                             params={"dates": day.strftime("%Y%m%d")})
+            finals: list[tuple[str, int, str, int]] = []
+            for ev in data.get("events", []):
+                comp = ev["competitions"][0]
+                if comp["status"]["type"].get("state") != "post":
+                    continue
+                sides = {c["homeAway"]: c for c in comp["competitors"]}
+                try:
+                    away_pts = int(sides["away"].get("score"))
+                    home_pts = int(sides["home"].get("score"))
+                except (TypeError, ValueError):
+                    continue
+                finals.append((sides["away"]["team"]["displayName"], away_pts,
+                               sides["home"]["team"]["displayName"], home_pts))
+            if not finals:
+                continue
+            blowout = max(finals, key=lambda g: abs(g[1] - g[3]))
+            margin = abs(blowout[1] - blowout[3])
+            winner = blowout[0] if blowout[1] > blowout[3] else blowout[2]
+            shootout = max(finals, key=lambda g: g[1] + g[3])
+            combined = shootout[1] + shootout[3]
+            return (
+                f"Widest margin: {winner} by {margin} "
+                f"({blowout[0]} {blowout[1]}, {blowout[2]} {blowout[3]}).\n"
+                f"Highest-scoring: {shootout[0]} {shootout[1]} @ {shootout[2]} {shootout[3]} "
+                f"— {combined} combined points."
+            )
+        return None
+    except Exception:  # noqa: BLE001 - a missing stat shouldn't break the digest
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -257,8 +318,8 @@ def build_team_section() -> str | None:
          f"{ESPN_SITE}/teams/{TEAM}/schedule" or the scoreboard filtered by team
       3. pull team-specific news from
          f"{ESPN_SITE}/news?team={TEAM}" (or a team RSS feed)
-      4. return a short text block; main() already puts it first in the digest
-         and the prompt already asks Claude to lead with it when present.
+      4. return a short text block; main() already puts it first in the digest,
+         and both digest builders lead with it when present.
     """
     if not TEAM:
         return None
@@ -267,7 +328,54 @@ def build_team_section() -> str | None:
 
 
 # --------------------------------------------------------------------------- #
-# Claude
+# Digest assembly — plain Python (default, free)
+# --------------------------------------------------------------------------- #
+
+_BOX_SCORE_NOTE = re.compile(r"\s*\[[^\]]*\]")
+_MAX_STORYLINES = 8
+
+
+def _plain_scores(text: str) -> str:
+    """Drop the verbose passing/rushing/receiving notes for the email."""
+    return _BOX_SCORE_NOTE.sub("", text)
+
+
+def _plain_storylines(text: str) -> str:
+    lines = [ln for ln in text.splitlines() if ln.lstrip().startswith("- ")]
+    trimmed = lines[:_MAX_STORYLINES]
+    if len(lines) > _MAX_STORYLINES:
+        trimmed.append(f"  (+{len(lines) - _MAX_STORYLINES} more headlines)")
+    return "\n".join(trimmed)
+
+
+def build_digest_plaintext(sections: dict[str, str]) -> str:
+    today = datetime.now(LOCAL_TZ)
+    parts = [f"NFL DAILY DIGEST — {today:%A %d %B %Y}"]
+
+    if "Your Team" in sections:
+        parts.append("YOUR TEAM\n" + sections["Your Team"])
+
+    renderers = [
+        ("Scores", "1. SCORES", _plain_scores),
+        ("Standings", "2. STANDINGS SNAPSHOT", None),
+        ("Headlines", "3. STORYLINES", _plain_storylines),
+        ("This week's schedule", "4. THIS WEEK'S SCHEDULE", None),
+    ]
+    for key, title, transform in renderers:
+        body = sections.get(key)
+        if body and transform:
+            body = transform(body)
+        parts.append(f"{title}\n{body}" if body else f"{title}\ndata unavailable today")
+
+    stat = compute_stat_of_day()
+    if stat:
+        parts.append("5. STAT OF THE DAY\n" + stat)
+
+    return "\n\n".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# Digest assembly — Claude (optional, USE_LLM = True)
 # --------------------------------------------------------------------------- #
 
 DIGEST_INSTRUCTIONS = """\
@@ -298,6 +406,8 @@ concise. No preamble, no sign-off — just the digest."""
 
 
 def generate_digest(sections: dict[str, str]) -> str:
+    import anthropic  # imported lazily so the free path needs no anthropic install
+
     client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
     today = datetime.now(LOCAL_TZ)
     data_blob = "\n\n".join(f"=== {name} ===\n{body}" for name, body in sections.items())
@@ -410,17 +520,20 @@ def main() -> None:
         )
         sys.exit(1)
 
-    try:
-        digest = generate_digest(sections)
-    except Exception as e:  # noqa: BLE001
-        traceback.print_exc()
-        _safe_send(
-            f"{subject} (PARTIAL — Claude call failed)",
-            f"Data was fetched but the Claude API call failed:\n\n{e}\n\n"
-            "Raw data follows so you're not left in the dark:\n\n"
-            + "\n\n".join(f"=== {k} ===\n{v}" for k, v in sections.items()),
-        )
-        sys.exit(1)
+    if USE_LLM:
+        try:
+            digest = generate_digest(sections)
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            _safe_send(
+                f"{subject} (PARTIAL — Claude call failed)",
+                f"Data was fetched but the Claude API call failed:\n\n{e}\n\n"
+                "Raw data follows so you're not left in the dark:\n\n"
+                + "\n\n".join(f"=== {k} ===\n{v}" for k, v in sections.items()),
+            )
+            sys.exit(1)
+    else:
+        digest = build_digest_plaintext(sections)
 
     if errors:
         digest = (
