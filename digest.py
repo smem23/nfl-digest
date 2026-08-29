@@ -434,9 +434,10 @@ DEFAULT_FROM = "NFL Digest <onboarding@resend.dev>"
 
 
 def send_email(subject: str, body: str) -> None:
-    api_key = os.environ["RESEND_API_KEY"]
-    recipient = os.environ["RECIPIENT_EMAIL"]
-    sender = os.environ.get("EMAIL_FROM") or DEFAULT_FROM
+    # .strip() guards against a trailing newline / stray space in a pasted secret.
+    api_key = os.environ["RESEND_API_KEY"].strip()
+    recipient = os.environ["RECIPIENT_EMAIL"].strip()
+    sender = (os.environ.get("EMAIL_FROM") or DEFAULT_FROM).strip()
 
     resp = requests.post(
         "https://api.resend.com/emails",
