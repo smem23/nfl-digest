@@ -433,11 +433,23 @@ def generate_digest(sections: dict[str, str]) -> str:
 DEFAULT_FROM = "NFL Digest <onboarding@resend.dev>"
 
 
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
 def send_email(subject: str, body: str) -> None:
     # .strip() guards against a trailing newline / stray space in a pasted secret.
     api_key = os.environ["RESEND_API_KEY"].strip()
-    recipient = os.environ["RECIPIENT_EMAIL"].strip()
+    recipient = os.environ["RECIPIENT_EMAIL"].strip().strip('"').strip("'").strip()
     sender = (os.environ.get("EMAIL_FROM") or DEFAULT_FROM).strip()
+
+    if not _EMAIL_RE.match(recipient):
+        raise RuntimeError(
+            "RECIPIENT_EMAIL is not a plain email address. "
+            f"Got length={len(recipient)}, has_space={' ' in recipient}, "
+            f"has_angle={'<' in recipient or '>' in recipient}, "
+            f"at_count={recipient.count('@')}. "
+            "Set the secret to exactly: you@example.com  (no name, no <>, no quotes)."
+        )
 
     resp = requests.post(
         "https://api.resend.com/emails",
