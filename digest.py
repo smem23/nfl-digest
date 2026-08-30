@@ -72,8 +72,27 @@ RSS_FEEDS = [
 ]
 
 MAX_STORYLINES = 8
+MAX_QB_HEADLINES = 8
 HTTP_TIMEOUT = 20
 HEADERS = {"User-Agent": "nfl-digest/2.0 (github actions cron)"}
+
+# Headline is "QB news" if it mentions the position or a current-ish starting QB.
+# Full names for common surnames (Allen/Jackson/Smith/etc. are too ambiguous alone).
+_QB_TERMS = re.compile(r"\b(quarterbacks?|qbs?|qb1|signal[- ]caller|backup qb|"
+                       r"starting job under center)\b", re.I)
+_QB_NAMES = re.compile(
+    r"\b(mahomes|joe burrow|lamar jackson|jalen hurts|justin herbert|dak prescott|"
+    r"trevor lawrence|jordan love|c\.?\s?j\.? stroud|jayden daniels|drake maye|"
+    r"caleb williams|bo nix|brock purdy|jared goff|matthew stafford|aaron rodgers|"
+    r"kirk cousins|sam darnold|baker mayfield|tua tagovailoa|tagovailoa|kyler murray|"
+    r"russell wilson|justin fields|deshaun watson|anthony richardson|michael penix|"
+    r"j\.?\s?j\.? mccarthy|josh allen|geno smith|will levis|bryce young|mac jones|"
+    r"jacoby brissett|quinn ewers|shedeur sanders|jaxson dart|spencer rattler|"
+    r"aidan o'connell|jameis winston|daniel jones|joe flacco|jarrett stidham)\b", re.I)
+
+
+def is_qb_headline(title: str) -> bool:
+    return bool(_QB_TERMS.search(title) or _QB_NAMES.search(title))
 
 
 class FetchError(Exception):
@@ -247,29 +266,41 @@ def fetch_standings() -> list[dict]:
     raise FetchError("standings: " + " | ".join(errors))
 
 
+def _pre_games(data: dict) -> list[dict]:
+    games: list[dict] = []
+    for ev in data.get("events", []):
+        comp = ev["competitions"][0]
+        if comp["status"]["type"].get("state") != "pre":
+            continue
+        sides = {c["homeAway"]: c for c in comp["competitors"]}
+        if "home" not in sides or "away" not in sides:
+            continue
+        games.append({"away": _team_label(sides["away"]),
+                      "home": _team_label(sides["home"]),
+                      "away_abbr": _team_abbr(sides["away"]),
+                      "home_abbr": _team_abbr(sides["home"]),
+                      "kickoff": _kickoff(ev)})
+    return games
+
+
 def fetch_schedule() -> list[dict]:
     try:
         today_et = datetime.now(EASTERN_TZ).date()
         end = today_et + timedelta(days=9)  # reach the next slate even mid-week
-        data = _get_json(
-            f"{ESPN_SITE}/scoreboard",
-            params={"dates": f"{today_et:%Y%m%d}-{end:%Y%m%d}", "limit": 200},
-        )
-        games: list[dict] = []
-        for ev in data.get("events", []):
-            comp = ev["competitions"][0]
-            if comp["status"]["type"].get("state") != "pre":
-                continue
-            sides = {c["homeAway"]: c for c in comp["competitors"]}
-            if "home" not in sides or "away" not in sides:
-                continue
-            games.append({"away": _team_label(sides["away"]),
-                          "home": _team_label(sides["home"]),
-                          "away_abbr": _team_abbr(sides["away"]),
-                          "home_abbr": _team_abbr(sides["home"]),
-                          "kickoff": _kickoff(ev)})
-        games.sort(key=lambda g: g["kickoff"])
-        return games
+        # 1) the coming week by date range (right during the season)
+        # 2) regular-season Week 1 (covers the preseason -> Week 1 dead period)
+        # 3) ESPN's "current" slate (last resort)
+        attempts = [
+            {"dates": f"{today_et:%Y%m%d}-{end:%Y%m%d}", "limit": 200},
+            {"seasontype": 2, "week": 1, "limit": 100},
+            {"limit": 100},
+        ]
+        for params in attempts:
+            games = _pre_games(_get_json(f"{ESPN_SITE}/scoreboard", params=params))
+            if games:
+                games.sort(key=lambda g: g["kickoff"])
+                return games[:16]  # one slate's worth
+        return []
     except Exception as e:  # noqa: BLE001
         raise FetchError(f"schedule: {e}") from e
 
@@ -286,7 +317,7 @@ def fetch_headlines() -> list[dict]:
                 raise RuntimeError(getattr(parsed, "bozo_exception", "no entries"))
             items = [
                 {"source": name, "title": title, "link": entry.get("link", "")}
-                for entry in parsed.entries[:8]
+                for entry in parsed.entries[:15]
                 if (title := (entry.get("title") or "").strip())
             ]
             if items:
@@ -444,11 +475,12 @@ def _standings_html(divisions: list[dict]) -> str:
     return "".join(blocks)
 
 
-def _headlines_html(items: list[dict]) -> str:
+def _headlines_html(items: list[dict], limit: int = MAX_STORYLINES,
+                    empty: str = "No headlines today.") -> str:
     if not items:
-        return _muted_line("No headlines today.")
+        return _muted_line(empty)
     lis: list[str] = []
-    for it in items[:MAX_STORYLINES]:
+    for it in items[:limit]:
         title = _esc(it["title"])
         if it.get("link"):
             title = (f'<a href="{_esc(it["link"])}" style="color:{_ACCENT};'
@@ -500,6 +532,8 @@ def render_html(sections: dict, errors: list[str]) -> str:
                          f'<div style="font-size:15px;line-height:1.5;">'
                          f'{_esc(sections["team"])}</div>')
     body += _section("Scores", _scores_html(sections.get("scores")))
+    body += _section("Quarterbacks", _headlines_html(
+        sections.get("qbs") or [], limit=MAX_QB_HEADLINES, empty="No quarterback news today."))
     body += _section("Standings", _standings_html(sections.get("standings") or []))
     body += _section("Storylines", _headlines_html(sections.get("headlines") or []))
     body += _section("This week", _schedule_html(sections.get("schedule") or []))
@@ -552,6 +586,12 @@ def render_text(sections: dict, errors: list[str]) -> str:
         lines.append(f"  {g['away']} at {g['home']} — {g['kickoff']:%H:%M}")
     if not sc or not (sc["finals"] or sc["live"] or sc["scheduled"]):
         lines.append("  No games in the last few days or scheduled today.")
+
+    lines += ["", "QUARTERBACKS"]
+    for it in (sections.get("qbs") or [])[:MAX_QB_HEADLINES]:
+        lines.append(f"  - {it['title']} ({it['source']})")
+    if not sections.get("qbs"):
+        lines.append("  no quarterback news today")
 
     lines += ["", "STANDINGS"]
     for div in sections.get("standings") or []:
@@ -786,11 +826,12 @@ def _pg_standings(divisions: list[dict]) -> str:
     )
 
 
-def _pg_storylines(items: list[dict]) -> str:
+def _pg_storylines(items: list[dict], limit: int = 12,
+                   empty: str = "No headlines today.") -> str:
     if not items:
-        return '<p class="none">No headlines today.</p>'
+        return f'<p class="none">{_esc(empty)}</p>'
     out = []
-    for it in items[:12]:
+    for it in items[:limit]:
         href = _esc(it["link"]) if it.get("link") else ""
         if href:
             out.append(f'<a class="story" href="{href}" target="_blank" rel="noopener">'
@@ -827,6 +868,8 @@ def render_page(sections: dict, errors: list[str]) -> str:
         cards.append(f'<section class="card"><h2>Your team</h2>'
                      f'<p>{_esc(sections["team"])}</p></section>')
     cards.append(f'<section class="card"><h2>Scores</h2>{_pg_scores(sections.get("scores"))}</section>')
+    cards.append(f'<section class="card"><h2>Quarterbacks</h2>'
+                 f'{_pg_storylines(sections.get("qbs") or [], empty="No quarterback news today.")}</section>')
     cards.append(f'<section class="card"><h2>Standings</h2>'
                  f'{_pg_standings(sections.get("standings") or [])}</section>')
     cards.append(f'<section class="card"><h2>Storylines</h2>'
@@ -961,6 +1004,8 @@ def main() -> None:
 
     sections["stat"] = compute_stat_of_day()
     sections["team"] = build_team_section()
+    sections["qbs"] = [h for h in (sections.get("headlines") or [])
+                       if is_qb_headline(h["title"])][:MAX_QB_HEADLINES]
 
     today = datetime.now(LOCAL_TZ)
     subject = f"NFL Daily Digest — {today:%a} {today.day} {today:%b}"
