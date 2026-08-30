@@ -1,16 +1,22 @@
 # nfl-digest
 
-Automated daily NFL email digest — scores, standings, storylines, schedule and a
-stat of the day. Runs on GitHub Actions on a schedule; no machine of your own
-needs to stay on.
+An automated daily NFL digest — scores, standings, storylines, schedule and a
+stat of the day — published as a **phone-friendly web page** and (optionally)
+emailed. Runs on GitHub Actions on a schedule; no machine of your own stays on.
 
+- **Page:** rebuilt every run and deployed to **GitHub Pages** →
+  `https://<user>.github.io/nfl-digest/`
+- **Email:** optional, via the [Resend](https://resend.com) API (free tier);
+  sent only on the 11:00 Europe/Dublin run
 - **Runner:** GitHub Actions (free tier)
-- **Schedule:** daily, targeting **11:00 Europe/Dublin**
 - **Data:** ESPN's public (unofficial) API for scores/standings + RSS feeds for headlines
-- **Digest:** assembled in plain Python by default (free); optionally written by
-  Claude (see below)
-- **Delivery:** email via the [Resend](https://resend.com) API (free tier)
+- **Digest text:** assembled in plain Python by default (free); optionally
+  written by Claude (see below)
 - **Secrets:** GitHub encrypted repository secrets — never committed
+
+`digest.py` config flags at the top: `WRITE_PAGE`, `SEND_EMAIL`, `USE_LLM`
+(the workflow overrides the first two per step via `DIGEST_WRITE_PAGE` /
+`DIGEST_SEND_EMAIL`).
 
 ## Cost
 
@@ -23,12 +29,13 @@ $5 minimum credit top-up. Off by default.
 
 ## Digest format
 
-Plain text, phone-readable in under two minutes, always in this order:
+A clean HTML email (with a plain-text fallback), phone-readable in under two
+minutes, always in this order:
 
-1. **Scores** — last slate's finals, one line each
-2. **Standings snapshot** — division standings, compact
-3. **Storylines** — recent headlines (top 8)
-4. **This week's schedule** — upcoming games
+1. **Scores** — last slate's finals, winner in bold, plus anything live or later today
+2. **Standings** — all eight divisions, two columns
+3. **Storylines** — recent headlines (top 8), each linked to the article
+4. **This week** — upcoming games with kickoff times
 5. **Stat of the day** — widest margin + highest-scoring game from the last slate
 
 A per-team **"Your Team"** section is stubbed out (`TEAM` + `build_team_section()`
@@ -59,10 +66,16 @@ Repo → **Settings → Secrets and variables → Actions → New repository sec
 | `EMAIL_FROM` | *(optional)* custom From once you've verified a domain in Resend |
 | `ANTHROPIC_API_KEY` | *(optional)* only if you set `USE_LLM = True` |
 
-### 3. Run it manually first
+### 3. Enable GitHub Pages
 
-Repo → **Actions → NFL Daily Digest → Run workflow**. Confirm it goes green and
-the email arrives before relying on the schedule.
+Repo → **Settings → Pages → Build and deployment → Source: GitHub Actions**.
+(Pages needs the repo to be **public** on the free plan.)
+
+### 4. Run it manually first
+
+Repo → **Actions → NFL Daily Digest → Run workflow**. Confirm it goes green, the
+page loads at `https://<user>.github.io/nfl-digest/`, and (if enabled) the email
+arrives — before relying on the schedule.
 
 ## Local testing
 
