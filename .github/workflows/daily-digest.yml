@@ -2,12 +2,12 @@ name: NFL Daily Digest
 
 on:
   schedule:
-    # Target: 11:00 Europe/Dublin. Cron runs in UTC with no DST handling, so we
-    # fire twice — 10:00 UTC (Irish Summer Time, UTC+1) and 11:00 UTC (winter,
-    # UTC+0). The page is rebuilt on both runs; digest.py only *emails* on the
-    # run that lands at 11:00 Dublin local time.
+    # Target: 10:00 Europe/Dublin, every day. Cron runs in UTC with no DST, so
+    # both entries are declared — 09:00 UTC is 10:00 Dublin in summer (IST),
+    # 10:00 UTC is 10:00 Dublin in winter (GMT). The page is small and cheap to
+    # rebuild, so both runs redeploy it; the page is always fresh by 10:00 local.
+    - cron: "0 9 * * *"
     - cron: "0 10 * * *"
-    - cron: "0 11 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -35,18 +35,6 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Build the page
-        env:
-          DIGEST_SEND_EMAIL: "0"
-        run: python digest.py
-
-      - name: Send the digest email
-        continue-on-error: true
-        env:
-          DIGEST_WRITE_PAGE: "0"
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
-          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
         run: python digest.py
 
       - name: Upload Pages artifact
