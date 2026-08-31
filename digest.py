@@ -278,12 +278,16 @@ def fetch_schedule() -> list[dict]:
             {"seasontype": 2, "week": 1, "limit": 100},
             {"limit": 100},
         ]
+        best: list[dict] = []
         for params in attempts:
             games = _pre_games(_get_json(f"{ESPN_SITE}/scoreboard", params=params))
-            if games:
+            if len(games) >= 4:  # a real slate — stop here
                 games.sort(key=lambda g: g["kickoff"])
-                return games[:16]  # one slate's worth
-        return []
+                return games[:16]
+            if len(games) > len(best):
+                best = games
+        best.sort(key=lambda g: g["kickoff"])
+        return best[:16]
     except Exception as e:  # noqa: BLE001
         raise FetchError(f"schedule: {e}") from e
 
