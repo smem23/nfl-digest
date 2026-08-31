@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """NFL Daily Digest.
 
-Fetch NFL scores, standings, headlines and the upcoming schedule, render them as
-a clean HTML email, and send it via Resend.
+Fetch NFL scores, standings, headlines and the upcoming schedule, and render them
+as a phone-friendly web page (public/index.html) for GitHub Pages.
 
-By default the digest is built entirely in Python and costs nothing to run.
-Set USE_LLM = True (and provide an Anthropic API key + credit) to have Claude
-write an editorial version of the prose instead.
+Runs on GitHub Actions on a schedule; the workflow rebuilds and redeploys the
+page every morning. No email, no API keys, no cost.
 
-Env-var switches (see README):
+Env-var switches:
 
-    DIGEST_SKIP_LLM=1   fetch data and print the plain-text digest, then stop
-    DIGEST_DRY_RUN=1    build the digest but print it instead of emailing
-    DIGEST_FORCE=1      ignore the "is it 11:00 in Dublin?" cron guard
+    DIGEST_PRINT=1        fetch data and print a plain-text dump, don't write the page
+    DIGEST_PAGE_PATH=...  write the page somewhere other than public/index.html
 
 Structured so a per-team "Your Team" block can be added later without a rewrite:
 set TEAM and fill in build_team_section().
@@ -24,7 +22,6 @@ import html
 import os
 import re
 import sys
-import traceback
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -39,22 +36,7 @@ import feedparser
 LOCAL_TZ = ZoneInfo("Europe/Dublin")
 EASTERN_TZ = ZoneInfo("America/New_York")  # NFL scheduling is US-Eastern
 
-def _flag(name: str, default: bool) -> bool:
-    v = os.environ.get(name)
-    return default if v is None else v.strip().lower() not in ("0", "", "false", "no")
-
-
-# What the run produces. Both default on; the workflow flips these per step
-# with DIGEST_WRITE_PAGE / DIGEST_SEND_EMAIL.
-WRITE_PAGE = _flag("DIGEST_WRITE_PAGE", True)   # phone-friendly page for GitHub Pages
-SEND_EMAIL = _flag("DIGEST_SEND_EMAIL", True)   # also email the digest via Resend
 PAGE_PATH = "public/index.html"
-
-# Free by default. True routes the prose through the Anthropic API — pay-as-you-go
-# (~$1/month here), needs ANTHROPIC_API_KEY plus loaded credit and the `anthropic`
-# line uncommented in requirements.txt.
-USE_LLM = False
-MODEL = "claude-opus-5"  # used only when USE_LLM is True; "claude-sonnet-5" is cheaper
 
 # Future: an ESPN team abbreviation (e.g. "PHI") to enable the "Your Team" block.
 TEAM: str | None = None
@@ -71,13 +53,14 @@ RSS_FEEDS = [
     ("ProFootballTalk", "https://profootballtalk.nbcsports.com/feed/"),
 ]
 
-MAX_STORYLINES = 8
+MAX_STORYLINES = 12
 MAX_QB_HEADLINES = 8
 HTTP_TIMEOUT = 20
-HEADERS = {"User-Agent": "nfl-digest/2.0 (github actions cron)"}
+HEADERS = {"User-Agent": "nfl-digest/3.0 (github actions cron)"}
 
-# Headline is "QB news" if it mentions the position or a current-ish starting QB.
-# Full names for common surnames (Allen/Jackson/Smith/etc. are too ambiguous alone).
+# A headline counts as "QB news" if it mentions the position or a current-ish
+# starting QB by name. Full names — surnames alone (Allen/Jackson/Smith/...) are
+# too ambiguous. Refresh this list each season as starters change.
 _QB_TERMS = re.compile(r"\b(quarterbacks?|qbs?|qb1|signal[- ]caller|backup qb|"
                        r"starting job under center)\b", re.I)
 _QB_NAMES = re.compile(
@@ -379,8 +362,8 @@ def build_team_section() -> str | None:
 
     To enable later: set TEAM to a team abbreviation, fetch that team's last
     result + next game (f"{ESPN_SITE}/teams/{TEAM}/schedule") and team news
-    (f"{ESPN_SITE}/news?team={TEAM}"), and return a short string. main() puts it
-    first and both renderers lead with it.
+    (f"{ESPN_SITE}/news?team={TEAM}"), and return a short string. render_page()
+    already leads with it when present.
     """
     if not TEAM:
         return None
@@ -388,287 +371,12 @@ def build_team_section() -> str | None:
 
 
 # --------------------------------------------------------------------------- #
-# HTML rendering (default, free)
+# Web page rendering (phone-friendly, for GitHub Pages)
 # --------------------------------------------------------------------------- #
-
-_FONT = ("-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,"
-         "Helvetica,Arial,sans-serif")
-_INK = "#1f2937"
-_MUTED = "#6b7280"
-_FAINT = "#9ca3af"
-_RULE = "#e5e7eb"
-_ACCENT = "#1d4ed8"
-
 
 def _esc(value) -> str:
     return html.escape(str(value), quote=True)
 
-
-def _label(text: str) -> str:
-    return (f'<div style="font-size:12px;color:{_MUTED};margin:14px 0 4px;'
-            f'text-transform:uppercase;letter-spacing:.5px;">{_esc(text)}</div>')
-
-
-def _section(title: str, inner: str) -> str:
-    return (f'<h2 style="font-size:13px;font-weight:700;letter-spacing:1px;'
-            f'text-transform:uppercase;color:#111827;margin:30px 0 12px;">'
-            f'{_esc(title)}</h2>{inner}')
-
-
-def _score_row(away: str, a, home: str, h, winner: str | None, note: str = "") -> str:
-    def side(name: str, score, win: bool) -> str:
-        weight = "700" if win else "400"
-        color = "#111827" if win else _MUTED
-        return (f'<span style="font-weight:{weight};color:{color};">'
-                f'{_esc(name)} {_esc(score)}</span>')
-
-    left = side(away, a, winner == "away")
-    right = side(home, h, winner == "home")
-    tail = (f' &nbsp;<span style="color:{_FAINT};font-size:13px;">{_esc(note)}</span>'
-            if note else "")
-    return (f'<div style="padding:6px 0;border-bottom:1px solid #f3f4f6;font-size:15px;">'
-            f'{left} <span style="color:#d1d5db;">·</span> {right}{tail}</div>')
-
-
-def _scores_html(scores: dict | None) -> str:
-    if not scores or not (scores["finals"] or scores["live"] or scores["scheduled"]):
-        return _muted_line("No games in the last few days or scheduled today.")
-    out: list[str] = []
-    if scores["finals"]:
-        out.append(_label(f"Final — {scores['final_day']}"))
-        for g in scores["finals"]:
-            out.append(_score_row(g["away"], g["away_score"], g["home"],
-                                  g["home_score"], g.get("winner")))
-    if scores["live"]:
-        out.append(_label("In progress"))
-        for g in scores["live"]:
-            out.append(_score_row(g["away"], g["away_score"], g["home"],
-                                  g["home_score"], None, g.get("detail", "")))
-    if scores["scheduled"]:
-        out.append(_label("Later today"))
-        for g in scores["scheduled"]:
-            out.append(f'<div style="padding:6px 0;font-size:15px;">{_esc(g["away"])} '
-                       f'<span style="color:#d1d5db;">at</span> {_esc(g["home"])} '
-                       f'<span style="color:{_MUTED};">· {g["kickoff"]:%H:%M}</span></div>')
-    return "".join(out)
-
-
-def _standings_html(divisions: list[dict]) -> str:
-    if not divisions:
-        return _muted_line("Standings unavailable today.")
-    blocks: list[str] = []
-    for div in divisions:
-        rows = "".join(
-            f'<tr><td style="padding:2px 0;font-size:14px;">{_esc(t["name"])}</td>'
-            f'<td align="right" style="padding:2px 0;font-size:14px;color:{_MUTED};'
-            f'white-space:nowrap;">{_esc(t["record"])}</td></tr>'
-            for t in div["teams"]
-        )
-        blocks.append(
-            f'<div style="display:inline-block;width:100%;max-width:240px;'
-            f'vertical-align:top;margin:0 16px 14px 0;">'
-            f'<div style="font-weight:700;font-size:13px;margin-bottom:4px;">'
-            f'{_esc(div["division"])}</div>'
-            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
-            f'style="line-height:1.35;">{rows}</table></div>'
-        )
-    return "".join(blocks)
-
-
-def _headlines_html(items: list[dict], limit: int = MAX_STORYLINES,
-                    empty: str = "No headlines today.") -> str:
-    if not items:
-        return _muted_line(empty)
-    lis: list[str] = []
-    for it in items[:limit]:
-        title = _esc(it["title"])
-        if it.get("link"):
-            title = (f'<a href="{_esc(it["link"])}" style="color:{_ACCENT};'
-                     f'text-decoration:none;">{title}</a>')
-        lis.append(f'<li style="margin:8px 0;line-height:1.45;font-size:15px;">{title}'
-                   f' <span style="color:{_FAINT};font-size:12px;">'
-                   f'{_esc(it["source"])}</span></li>')
-    return f'<ul style="margin:0;padding-left:20px;">{"".join(lis)}</ul>'
-
-
-def _schedule_html(games: list[dict]) -> str:
-    if not games:
-        return _muted_line("No games scheduled in the coming week.")
-    rows = [
-        f'<div style="padding:5px 0;font-size:15px;">'
-        f'<span style="color:{_MUTED};">{_short_datetime(g["kickoff"])}</span>'
-        f'&nbsp; {_esc(g["away"])} <span style="color:#d1d5db;">at</span> {_esc(g["home"])}</div>'
-        for g in games
-    ]
-    return "".join(rows)
-
-
-def _stat_html(stat: str | None) -> str:
-    if not stat:
-        return ""
-    return (f'<div style="background:#eff6ff;border-left:3px solid {_ACCENT};'
-            f'padding:14px 16px;border-radius:4px;font-size:15px;line-height:1.55;">'
-            f'{_esc(stat)}</div>')
-
-
-def _muted_line(text: str) -> str:
-    return f'<div style="color:{_MUTED};font-size:14px;font-style:italic;">{_esc(text)}</div>'
-
-
-def render_html(sections: dict, errors: list[str]) -> str:
-    today = datetime.now(LOCAL_TZ)
-    date_str = f"{today:%A} {today.day} {today:%B %Y}"
-
-    notice = ""
-    if errors:
-        names = ", ".join(sorted({e.split(":")[0] for e in errors}))
-        notice = (f'<div style="background:#fef2f2;border-left:3px solid #ef4444;'
-                  f'padding:10px 14px;font-size:13px;color:#991b1b;margin-bottom:8px;">'
-                  f'Some sources were unavailable today: {_esc(names)}.</div>')
-
-    body = notice
-    if sections.get("team"):
-        body += _section("Your Team",
-                         f'<div style="font-size:15px;line-height:1.5;">'
-                         f'{_esc(sections["team"])}</div>')
-    body += _section("Scores", _scores_html(sections.get("scores")))
-    body += _section("Quarterbacks", _headlines_html(
-        sections.get("qbs") or [], limit=MAX_QB_HEADLINES, empty="No quarterback news today."))
-    body += _section("Standings", _standings_html(sections.get("standings") or []))
-    body += _section("Storylines", _headlines_html(sections.get("headlines") or []))
-    body += _section("This week", _schedule_html(sections.get("schedule") or []))
-    if sections.get("stat"):
-        body += _section("Stat of the day", _stat_html(sections["stat"]))
-
-    return f"""<!doctype html>
-<html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#f4f4f5;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f5;padding:24px 10px;">
-<tr><td align="center">
-<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:100%;background:#ffffff;border-radius:12px;">
-<tr><td style="padding:32px 28px;font-family:{_FONT};color:{_INK};">
-<div style="font-size:12px;font-weight:700;letter-spacing:1.5px;color:{_ACCENT};text-transform:uppercase;">NFL Daily Digest</div>
-<div style="font-size:22px;font-weight:700;margin-top:4px;">{_esc(date_str)}</div>
-<div style="height:1px;background:{_RULE};margin:18px 0 0;"></div>
-{body}
-<div style="height:1px;background:{_RULE};margin:30px 0 14px;"></div>
-<div style="font-size:12px;color:{_FAINT};line-height:1.5;">Sent automatically by nfl-digest &middot; scores &amp; standings via ESPN &middot; headlines via ESPN, CBS Sports &amp; ProFootballTalk</div>
-</td></tr>
-</table>
-</td></tr>
-</table>
-</body>
-</html>"""
-
-
-# --------------------------------------------------------------------------- #
-# Plain-text rendering (email fallback + local preview + LLM input)
-# --------------------------------------------------------------------------- #
-
-def render_text(sections: dict, errors: list[str]) -> str:
-    today = datetime.now(LOCAL_TZ)
-    lines = [f"NFL Daily Digest — {today:%A} {today.day} {today:%B %Y}", ""]
-    if errors:
-        names = ", ".join(sorted({e.split(":")[0] for e in errors}))
-        lines += [f"(some sources unavailable: {names})", ""]
-
-    sc = sections.get("scores")
-    lines.append("SCORES")
-    if sc and sc["finals"]:
-        lines.append(f"Final — {sc['final_day']}")
-        for g in sc["finals"]:
-            lines.append(f"  {g['away']} {g['away_score']} – {g['home']} {g['home_score']}")
-    for g in (sc or {}).get("live", []):
-        lines.append(f"  LIVE  {g['away']} {g['away_score']} – {g['home']} {g['home_score']}"
-                     f"  ({g.get('detail','')})")
-    for g in (sc or {}).get("scheduled", []):
-        lines.append(f"  {g['away']} at {g['home']} — {g['kickoff']:%H:%M}")
-    if not sc or not (sc["finals"] or sc["live"] or sc["scheduled"]):
-        lines.append("  No games in the last few days or scheduled today.")
-
-    lines += ["", "QUARTERBACKS"]
-    for it in (sections.get("qbs") or [])[:MAX_QB_HEADLINES]:
-        lines.append(f"  - {it['title']} ({it['source']})")
-    if not sections.get("qbs"):
-        lines.append("  no quarterback news today")
-
-    lines += ["", "STANDINGS"]
-    for div in sections.get("standings") or []:
-        lines.append(div["division"])
-        for t in div["teams"]:
-            lines.append(f"  {t['name']:<24} {t['record']}")
-    if not sections.get("standings"):
-        lines.append("  unavailable today")
-
-    lines += ["", "STORYLINES"]
-    for it in (sections.get("headlines") or [])[:MAX_STORYLINES]:
-        lines.append(f"  - {it['title']} ({it['source']})")
-    if not sections.get("headlines"):
-        lines.append("  unavailable today")
-
-    lines += ["", "THIS WEEK"]
-    for g in sections.get("schedule") or []:
-        lines.append(f"  {_short_datetime(g['kickoff'])}  {g['away']} at {g['home']}")
-    if not sections.get("schedule"):
-        lines.append("  no games in the coming week")
-
-    if sections.get("stat"):
-        lines += ["", "STAT OF THE DAY", f"  {sections['stat']}"]
-
-    return "\n".join(lines)
-
-
-# --------------------------------------------------------------------------- #
-# LLM rendering (optional, USE_LLM = True)
-# --------------------------------------------------------------------------- #
-
-DIGEST_INSTRUCTIONS = """\
-You write a daily NFL email digest for someone who follows the league but has no \
-favourite team yet. Use ONLY the data given to you — never invent scores, names, \
-records or storylines. If a section is missing, say "data unavailable today".
-
-Plain prose, no markdown. Keep this order, with a short heading line for each:
-Scores · Standings snapshot · Storylines (3–5) · This week (with a one-line \
-"why it matters" per game) · Stat of the day.
-
-If a "Your Team" block is present, lead with it. Phone-readable in under two \
-minutes. Dry, warm, concise. No preamble, no sign-off."""
-
-
-def generate_digest(sections: dict) -> str:
-    import anthropic  # imported lazily so the free path needs no anthropic install
-
-    client = anthropic.Anthropic()
-    today = datetime.now(LOCAL_TZ)
-    message = client.messages.create(
-        model=MODEL,
-        max_tokens=2000,
-        system=DIGEST_INSTRUCTIONS,
-        messages=[{
-            "role": "user",
-            "content": (f"Today is {today:%A %d %B %Y}. Here is today's data:\n\n"
-                        + render_text(sections, [])),
-        }],
-    )
-    return "".join(b.text for b in message.content if b.type == "text").strip()
-
-
-def prose_to_html(prose: str) -> str:
-    paras = [p.strip() for p in prose.split("\n\n") if p.strip()]
-    body = "".join(
-        f'<p style="margin:0 0 15px;line-height:1.6;font-size:15px;">'
-        f'{_esc(p).replace(chr(10), "<br>")}</p>'
-        for p in paras
-    )
-    return (f'<!doctype html><html><body style="margin:0;background:#f4f4f5;">'
-            f'<div style="max-width:600px;margin:0 auto;padding:32px;background:#fff;'
-            f'font-family:{_FONT};color:{_INK};">{body}</div></body></html>')
-
-
-# --------------------------------------------------------------------------- #
-# Web page rendering (phone-friendly, for GitHub Pages)
-# --------------------------------------------------------------------------- #
 
 _PAGE_CSS = """
 *,*::before,*::after{box-sizing:border-box}
@@ -826,7 +534,7 @@ def _pg_standings(divisions: list[dict]) -> str:
     )
 
 
-def _pg_storylines(items: list[dict], limit: int = 12,
+def _pg_storylines(items: list[dict], limit: int = MAX_STORYLINES,
                    empty: str = "No headlines today.") -> str:
     if not items:
         return f'<p class="none">{_esc(empty)}</p>'
@@ -869,7 +577,7 @@ def render_page(sections: dict, errors: list[str]) -> str:
                      f'<p>{_esc(sections["team"])}</p></section>')
     cards.append(f'<section class="card"><h2>Scores</h2>{_pg_scores(sections.get("scores"))}</section>')
     cards.append(f'<section class="card"><h2>Quarterbacks</h2>'
-                 f'{_pg_storylines(sections.get("qbs") or [], empty="No quarterback news today.")}</section>')
+                 f'{_pg_storylines(sections.get("qbs") or [], limit=MAX_QB_HEADLINES, empty="No quarterback news today.")}</section>')
     cards.append(f'<section class="card"><h2>Standings</h2>'
                  f'{_pg_standings(sections.get("standings") or [])}</section>')
     cards.append(f'<section class="card"><h2>Storylines</h2>'
@@ -896,69 +604,48 @@ def render_page(sections: dict, errors: list[str]) -> str:
     )
 
 
-# --------------------------------------------------------------------------- #
-# Email (Resend HTTP API — https://resend.com/docs/api-reference/emails)
-# --------------------------------------------------------------------------- #
+def render_debug_text(sections: dict, errors: list[str]) -> str:
+    """Plain-text dump of the fetched data — for local checks (DIGEST_PRINT=1)."""
+    today = datetime.now(LOCAL_TZ)
+    lines = [f"NFL Daily — {today:%A} {today.day} {today:%B %Y}", ""]
+    if errors:
+        lines += ["(errors: " + " | ".join(errors) + ")", ""]
 
-# Resend's shared sender works with no domain setup, but only delivers to the
-# address that owns the Resend account. Verify a domain, then set EMAIL_FROM.
-DEFAULT_FROM = "NFL Digest <onboarding@resend.dev>"
+    sc = sections.get("scores")
+    lines.append("SCORES")
+    for g in (sc or {}).get("finals", []):
+        lines.append(f"  {g['away']} {g['away_score']} - {g['home']} {g['home_score']}")
+    for g in (sc or {}).get("live", []):
+        lines.append(f"  LIVE {g['away']} {g['away_score']} - {g['home']} {g['home_score']}")
+    for g in (sc or {}).get("scheduled", []):
+        lines.append(f"  {g['away']} at {g['home']} {g['kickoff']:%H:%M}")
 
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    lines += ["", "QUARTERBACKS"]
+    for it in (sections.get("qbs") or []):
+        lines.append(f"  - {it['title']} ({it['source']})")
 
+    lines += ["", "STANDINGS"]
+    for div in sections.get("standings") or []:
+        lines.append(div["division"])
+        for t in div["teams"]:
+            lines.append(f"  {t['name']:<24} {t['record']}")
 
-def send_email(subject: str, text_body: str, html_body: str | None = None) -> None:
-    api_key = os.environ["RESEND_API_KEY"].strip()
-    recipient = os.environ["RECIPIENT_EMAIL"].strip().strip('"').strip("'").strip()
-    sender = (os.environ.get("EMAIL_FROM") or DEFAULT_FROM).strip()
+    lines += ["", "STORYLINES"]
+    for it in (sections.get("headlines") or [])[:MAX_STORYLINES]:
+        lines.append(f"  - {it['title']} ({it['source']})")
 
-    if not _EMAIL_RE.match(recipient):
-        raise RuntimeError(
-            "RECIPIENT_EMAIL is not a plain email address. "
-            f"Got length={len(recipient)}, has_space={' ' in recipient}, "
-            f"has_angle={'<' in recipient or '>' in recipient}, "
-            f"at_count={recipient.count('@')}. "
-            "Set the secret to exactly: you@example.com  (no name, no <>, no quotes)."
-        )
+    lines += ["", "THIS WEEK"]
+    for g in sections.get("schedule") or []:
+        lines.append(f"  {_short_datetime(g['kickoff'])}  {g['away']} at {g['home']}")
 
-    payload = {"from": sender, "to": [recipient], "subject": subject, "text": text_body}
-    if html_body:
-        payload["html"] = html_body
-
-    resp = requests.post(
-        "https://api.resend.com/emails",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=30,
-    )
-    if resp.status_code >= 300:
-        raise RuntimeError(f"Resend API returned {resp.status_code}: {resp.text}")
-
-
-def _safe_send(subject: str, body: str) -> None:
-    try:
-        send_email(subject, body)
-        print(f"Sent failure notice: {subject}")
-    except Exception:  # noqa: BLE001
-        traceback.print_exc()
-        print("Could not send the failure email either.", file=sys.stderr)
+    if sections.get("stat"):
+        lines += ["", "STAT OF THE DAY", f"  {sections['stat']}"]
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
-
-def _skip_for_wrong_hour() -> bool:
-    """The workflow fires at 10:00 and 11:00 UTC to cover Irish DST; only the
-    run that lands at 11:00 Dublin local time should actually send."""
-    if os.environ.get("DIGEST_FORCE"):
-        return False
-    if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
-        return False
-    if not os.environ.get("CI"):
-        return False
-    return datetime.now(LOCAL_TZ).hour != 11
-
 
 def _write_page(html_doc: str) -> None:
     path = os.environ.get("DIGEST_PAGE_PATH", PAGE_PATH)
@@ -967,22 +654,6 @@ def _write_page(html_doc: str) -> None:
         os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(html_doc)
-
-
-def _build_email_bodies(sections: dict, errors: list[str], subject: str):
-    if USE_LLM:
-        try:
-            prose = generate_digest(sections)
-            return prose, prose_to_html(prose)
-        except Exception as e:  # noqa: BLE001
-            traceback.print_exc()
-            _safe_send(
-                f"{subject} (PARTIAL — Claude call failed)",
-                f"Data was fetched but the Claude API call failed:\n\n{e}\n\n"
-                "Raw digest follows:\n\n" + render_text(sections, errors),
-            )
-            return None, None
-    return render_text(sections, errors), render_html(sections, errors)
 
 
 def main() -> None:
@@ -1007,49 +678,22 @@ def main() -> None:
     sections["qbs"] = [h for h in (sections.get("headlines") or [])
                        if is_qb_headline(h["title"])][:MAX_QB_HEADLINES]
 
-    today = datetime.now(LOCAL_TZ)
-    subject = f"NFL Daily Digest — {today:%a} {today.day} {today:%b}"
     have_data = any(sections.get(k) for k in ("scores", "standings", "headlines", "schedule"))
-    dry = bool(os.environ.get("DIGEST_DRY_RUN"))
-    email_now = SEND_EMAIL and (dry or not _skip_for_wrong_hour())
 
-    if os.environ.get("DIGEST_SKIP_LLM"):
-        print("\n" + "=" * 60 + "\n")
-        print(render_text(sections, errors))
+    if os.environ.get("DIGEST_PRINT"):
+        print("\n" + render_debug_text(sections, errors))
         return
-
-    # The page is always (re)built so GitHub Pages never goes stale or empty.
-    if WRITE_PAGE:
-        _write_page(render_page(sections, errors))
-        print(f"Wrote {os.environ.get('DIGEST_PAGE_PATH', PAGE_PATH)}")
 
     if not have_data:
-        if email_now:
-            _safe_send(
-                f"{subject} (FAILED)",
-                "The NFL digest could not run today — every data source failed:\n\n"
-                + "\n".join(f"- {e}" for e in errors),
-            )
+        print("::error title=NFL digest::every data source failed today; page not rebuilt",
+              file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
         sys.exit(1)
 
-    if not SEND_EMAIL:
-        return
-    if not email_now:
-        print(f"Dublin time {today:%H:%M} — not the 11:00 run; page updated, email skipped.")
-        return
-
-    text_body, html_body = _build_email_bodies(sections, errors, subject)
-    if text_body is None:
-        return  # LLM failure already reported; don't fail the job / block the page
-    if dry:
-        print("\n" + "=" * 60 + f"\nSubject: {subject}\n" + "=" * 60 + "\n" + text_body)
-        return
-    try:
-        send_email(subject, text_body, html_body)
-        print(f"Sent: {subject}")
-    except Exception as e:  # noqa: BLE001 — email is secondary to the page
-        traceback.print_exc()
-        print(f"::error title=Digest email failed::{e}")
+    _write_page(render_page(sections, errors))
+    print(f"Wrote {os.environ.get('DIGEST_PAGE_PATH', PAGE_PATH)}"
+          + (f" (partial — {len(errors)} source(s) failed)" if errors else ""))
 
 
 if __name__ == "__main__":
